@@ -9,8 +9,8 @@ from common.scale import RunningScale
 from common.world_model import WorldModel
 from common.layers import api_model_conversion
 from tensordict import TensorDict
-from tdmpc2.tdmpc2 import TDMPC2
-from tdmpc2.hybrid_mpc import HybridMPC, MPCConfig, EnvironmentInterface
+from tdmpc2 import TDMPC2
+from hybrid_mpc import HybridMPC, MPCConfig, EnvironmentInterface
 
 
 @dataclass
@@ -127,7 +127,43 @@ class HybridTDMPC2(TDMPC2):
     Enhanced Hybrid TD-MPC2 agent with improved integration between classical and learned control.
     """
 
-    def __init__(self, cfg: HybridTDMPC2Config, env=None):
+    def __init__(self, cfg, env=None):
+        # Convert to hybrid config if needed and add missing attributes
+        if not hasattr(cfg, 'hybrid_mpc'):
+            cfg.hybrid_mpc = getattr(cfg, 'hybrid_mpc', False)
+        if not hasattr(cfg, 'hybrid_value_estimation'):
+            cfg.hybrid_value_estimation = getattr(cfg, 'hybrid_value_estimation', 'mixed')
+        if not hasattr(cfg, 'classical_weight_schedule'):
+            cfg.classical_weight_schedule = getattr(cfg, 'classical_weight_schedule', 'adaptive')
+        if not hasattr(cfg, 'state_conversion_method'):
+            cfg.state_conversion_method = getattr(cfg, 'state_conversion_method', 'identity')
+        if not hasattr(cfg, 'blend_actions'):
+            cfg.blend_actions = getattr(cfg, 'blend_actions', True)
+        if not hasattr(cfg, 'blend_horizon'):
+            cfg.blend_horizon = getattr(cfg, 'blend_horizon', 3)
+        if not hasattr(cfg, 'blend_temperature'):
+            cfg.blend_temperature = getattr(cfg, 'blend_temperature', 0.1)
+        if not hasattr(cfg, 'classical_trust_weight'):
+            cfg.classical_trust_weight = getattr(cfg, 'classical_trust_weight', 0.3)
+        if not hasattr(cfg, 'classical_trust_decay'):
+            cfg.classical_trust_decay = getattr(cfg, 'classical_trust_decay', 0.99)
+        if not hasattr(cfg, 'track_performance'):
+            cfg.track_performance = getattr(cfg, 'track_performance', True)
+        if not hasattr(cfg, 'performance_window'):
+            cfg.performance_window = getattr(cfg, 'performance_window', 100)
+        if not hasattr(cfg, 'warm_start_classical'):
+            cfg.warm_start_classical = getattr(cfg, 'warm_start_classical', True)
+        if not hasattr(cfg, 'warm_start_learned'):
+            cfg.warm_start_learned = getattr(cfg, 'warm_start_learned', True)
+        if not hasattr(cfg, 'max_classical_horizon'):
+            cfg.max_classical_horizon = getattr(cfg, 'max_classical_horizon', 10)
+        if not hasattr(cfg, 'min_classical_horizon'):
+            cfg.min_classical_horizon = getattr(cfg, 'min_classical_horizon', 0)
+        if not hasattr(cfg, 'transition_steps'):
+            cfg.transition_steps = getattr(cfg, 'transition_steps', 1_000_000)
+        if not hasattr(cfg, 'transition_schedule'):
+            cfg.transition_schedule = getattr(cfg, 'transition_schedule', 'linear')
+        
         # Initialize parent TD-MPC2
         super().__init__(cfg)
         
@@ -238,8 +274,9 @@ class HybridTDMPC2(TDMPC2):
     def _get_adaptive_classical_horizon(self, task=None):
         """Get classical horizon with task-specific and performance-based adaptation."""
         # Task-specific horizon if available
-        if task is not None and task.item() in self.cfg.task_specific_horizons:
-            base_horizon = self.cfg.task_specific_horizons[task.item()]
+        task_specific_horizons = getattr(self.cfg, 'task_specific_horizons', {})
+        if task is not None and task.item() in task_specific_horizons:
+            base_horizon = task_specific_horizons[task.item()]
         else:
             base_horizon = self.hybrid_mpc.get_classical_horizon()
         
@@ -314,7 +351,7 @@ class HybridTDMPC2(TDMPC2):
             
             # Update distribution with classical trust region
             mean, std = self._update_hybrid_distribution(
-                actions, values, mean, classical_horizon, iteration
+                actions, values, mean, classical_horizon, iteration, task
             )
         
         # Select final action with optional blending
@@ -473,7 +510,7 @@ class HybridTDMPC2(TDMPC2):
         return values
 
     def _update_hybrid_distribution(self, actions, values, prev_mean, 
-                                  classical_horizon, iteration):
+                                  classical_horizon, iteration, task):
         """Update action distribution with classical bias."""
         # Compute elite actions
         num_elites = self.cfg.num_elites

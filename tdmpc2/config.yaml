@@ -71,15 +71,15 @@ enable_wandb: true
 save_csv: true
 
 # hybrid MPC settings
-hybrid_mpc: false
-max_classical_horizon: 10
+hybrid_mpc: true
+max_classical_horizon: 12
 min_classical_horizon: 0
 transition_steps: 1_000_000
 transition_schedule: linear  # linear, exponential, step
 classical_algorithm: ilqg  # ilqg, lqr, ddp
-ilqg_iterations: 10
+ilqg_iterations: 5
 ilqg_line_search_steps: 10
-ilqg_regularization: 1e-6
+ilqg_regularization: 1e-4
 ilqg_tolerance: 1e-6
 finite_diff_eps: 1e-6
 

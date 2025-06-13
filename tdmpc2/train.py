@@ -15,6 +15,7 @@ from common.seed import set_seed
 from common.buffer import Buffer
 from envs import make_env
 from tdmpc2 import TDMPC2
+from hybrid_tdmpc2 import TDMPC2WithILQG
 from trainer.offline_trainer import OfflineTrainer
 from trainer.online_trainer import OnlineTrainer
 from common.logger import Logger
@@ -53,7 +54,7 @@ def train(cfg: dict):
 	trainer = trainer_cls(
 		cfg=cfg,
 		env=make_env(cfg),
-		agent=TDMPC2(cfg),
+		agent=TDMPC2WithILQG(cfg),
 		buffer=Buffer(cfg),
 		logger=Logger(cfg),
 	)

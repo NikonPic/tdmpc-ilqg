@@ -1,779 +1,707 @@
 import torch
 import torch.nn.functional as F
-import numpy as np
-from typing import Optional, Tuple, Dict, Any, List
-from dataclasses import dataclass, field
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict
 
 from common import math
 from common.scale import RunningScale
 from common.world_model import WorldModel
 from common.layers import api_model_conversion
 from tensordict import TensorDict
-from tdmpc2 import TDMPC2
-from hybrid_mpc import HybridMPC, MPCConfig, EnvironmentInterface
 
 
 @dataclass
-class HybridTDMPC2Config(MPCConfig):
-    """Extended configuration for Hybrid TD-MPC2."""
-    # Hybrid-specific parameters
-    hybrid_mpc: bool = True
-    hybrid_value_estimation: str = 'mixed'  # 'mixed', 'learned', 'classical'
-    classical_weight_schedule: str = 'adaptive'  # 'fixed', 'linear', 'adaptive'
-    state_conversion_method: str = 'identity'  # 'identity', 'encoder', 'learned'
-    
-    # Blending parameters
-    blend_actions: bool = True
-    blend_horizon: int = 3  # Number of steps to blend over
-    blend_temperature: float = 0.1
-    
-    # Classical MPC trust region
-    classical_trust_weight: float = 0.3
-    classical_trust_decay: float = 0.99
-    
-    # Performance tracking
-    track_performance: bool = True
-    performance_window: int = 100
-    
-    # Warm-starting
-    warm_start_classical: bool = True
-    warm_start_learned: bool = True
-    
-    # Multi-task specific
-    task_specific_horizons: Dict[int, int] = field(default_factory=dict)
+class ILQGConfig:
+    """Configuration for ILQG integration"""
+    enabled: bool = True
+    max_iterations: int = 5  # Reduziert von typischen 10-20
+    convergence_threshold: float = 1e-2  # Lockerer als 1e-6
+    line_search_steps: int = 5
+    regularization: float = 1e-4
+    horizon: int = 15  # Kann länger als MPPI horizon sein
+    num_workers: int = 2  # Thread-Pool Größe
+    trigger_uncertainty_threshold: float = 0.1
+    trigger_frequency: int = 3  # Alle N Steps
+    warm_start_from_tdmpc2: bool = True
+    max_time_budget_ms: float = 5.0  # Zeitlimit pro ILQG call
 
 
-class ImprovedEnvironmentInterface(EnvironmentInterface):
-    """Enhanced environment interface with better state/observation handling."""
-    
-    def __init__(self, cfg: HybridTDMPC2Config, env, world_model: WorldModel):
-        super().__init__(cfg, env)
-        self.world_model = world_model
-        self._state_dim = None
-        self._obs_dim = None
-        
-    @property
-    def state_dim(self):
-        """Get state dimension from environment."""
-        if self._state_dim is None:
-            if hasattr(self.env, 'state_dim'):
-                self._state_dim = self.env.state_dim
-            elif hasattr(self.env, 'observation_spec'):
-                # DMControl style
-                spec = self.env.observation_spec()
-                self._state_dim = sum([np.prod(v.shape) for v in spec.values()])
-            else:
-                # Fallback to observation dimension
-                self._state_dim = self.cfg.obs_dim
-        return self._state_dim
-    
-    @property
-    def obs_dim(self):
-        """Get observation dimension."""
-        if self._obs_dim is None:
-            self._obs_dim = self.cfg.obs_dim
-        return self._obs_dim
-    
-    def obs_to_state(self, obs: torch.Tensor) -> torch.Tensor:
-        """Convert observation to state for classical control."""
-        if self.cfg.state_conversion_method == 'identity':
-            # Direct mapping (assumes obs contains full state)
-            return obs
-        elif self.cfg.state_conversion_method == 'encoder':
-            # Use world model encoder then project to state space
-            with torch.no_grad():
-                z = self.world_model.encode(obs)
-                # Project latent to state dimension
-                if hasattr(self.world_model, 'latent_to_state'):
-                    return self.world_model.latent_to_state(z)
-                else:
-                    # Simple linear projection
-                    if not hasattr(self, '_latent_to_state_proj'):
-                        self._latent_to_state_proj = torch.nn.Linear(
-                            z.shape[-1], self.state_dim
-                        ).to(z.device)
-                    return self._latent_to_state_proj(z)
-        elif self.cfg.state_conversion_method == 'learned':
-            # Use a learned mapping
-            if hasattr(self.world_model, 'obs_to_state'):
-                return self.world_model.obs_to_state(obs)
-            else:
-                return obs  # Fallback
-        else:
-            return obs
-    
-    def state_to_obs(self, state: torch.Tensor) -> torch.Tensor:
-        """Convert state back to observation format."""
-        if self.cfg.state_conversion_method == 'identity':
-            return state
-        elif hasattr(self.world_model, 'state_to_obs'):
-            return self.world_model.state_to_obs(state)
-        else:
-            # Pad or truncate as needed
-            if state.shape[-1] < self.obs_dim:
-                padding = torch.zeros(*state.shape[:-1], self.obs_dim - state.shape[-1], device=state.device)
-                return torch.cat([state, padding], dim=-1)
-            else:
-                return state[..., :self.obs_dim]
-    
-    def compute_reward_from_cost(self, cost: torch.Tensor) -> torch.Tensor:
-        """Convert cost to reward for value estimation."""
-        # Simple negation with optional scaling
-        return -cost * self.cfg.get('cost_to_reward_scale', 1.0)
-
-
-class HybridTDMPC2(TDMPC2):
+class FastILQG:
     """
-    Enhanced Hybrid TD-MPC2 agent with improved integration between classical and learned control.
+    Performance-optimierte ILQG Implementation für Integration mit TDMPC2.
+    Verwendet shared TOLD model und TDMPC2 warm-starts.
     """
-
-    def __init__(self, cfg, env=None):
-        # Convert to hybrid config if needed and add missing attributes
-        if not hasattr(cfg, 'hybrid_mpc'):
-            cfg.hybrid_mpc = getattr(cfg, 'hybrid_mpc', False)
-        if not hasattr(cfg, 'hybrid_value_estimation'):
-            cfg.hybrid_value_estimation = getattr(cfg, 'hybrid_value_estimation', 'mixed')
-        if not hasattr(cfg, 'classical_weight_schedule'):
-            cfg.classical_weight_schedule = getattr(cfg, 'classical_weight_schedule', 'adaptive')
-        if not hasattr(cfg, 'state_conversion_method'):
-            cfg.state_conversion_method = getattr(cfg, 'state_conversion_method', 'identity')
-        if not hasattr(cfg, 'blend_actions'):
-            cfg.blend_actions = getattr(cfg, 'blend_actions', True)
-        if not hasattr(cfg, 'blend_horizon'):
-            cfg.blend_horizon = getattr(cfg, 'blend_horizon', 3)
-        if not hasattr(cfg, 'blend_temperature'):
-            cfg.blend_temperature = getattr(cfg, 'blend_temperature', 0.1)
-        if not hasattr(cfg, 'classical_trust_weight'):
-            cfg.classical_trust_weight = getattr(cfg, 'classical_trust_weight', 0.3)
-        if not hasattr(cfg, 'classical_trust_decay'):
-            cfg.classical_trust_decay = getattr(cfg, 'classical_trust_decay', 0.99)
-        if not hasattr(cfg, 'track_performance'):
-            cfg.track_performance = getattr(cfg, 'track_performance', True)
-        if not hasattr(cfg, 'performance_window'):
-            cfg.performance_window = getattr(cfg, 'performance_window', 100)
-        if not hasattr(cfg, 'warm_start_classical'):
-            cfg.warm_start_classical = getattr(cfg, 'warm_start_classical', True)
-        if not hasattr(cfg, 'warm_start_learned'):
-            cfg.warm_start_learned = getattr(cfg, 'warm_start_learned', True)
-        if not hasattr(cfg, 'max_classical_horizon'):
-            cfg.max_classical_horizon = getattr(cfg, 'max_classical_horizon', 10)
-        if not hasattr(cfg, 'min_classical_horizon'):
-            cfg.min_classical_horizon = getattr(cfg, 'min_classical_horizon', 0)
-        if not hasattr(cfg, 'transition_steps'):
-            cfg.transition_steps = getattr(cfg, 'transition_steps', 1_000_000)
-        if not hasattr(cfg, 'transition_schedule'):
-            cfg.transition_schedule = getattr(cfg, 'transition_schedule', 'linear')
+    
+    def __init__(self, world_model: WorldModel, config: ILQGConfig, device: torch.device):
+        self.model = world_model
+        self.config = config
+        self.device = device
+        self.horizon = config.horizon
         
-        # Initialize parent TD-MPC2
-        super().__init__(cfg)
+        # Caching für Linearisierungen (Performance!)
+        self.jacobian_cache = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
         
-        self.cfg = cfg  # Use hybrid config
-        self.env = env
-        self.hybrid_mpc_enabled = cfg.hybrid_mpc
+    def _compute_jacobians(self, z: torch.Tensor, u: torch.Tensor, task: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Berechnet Jacobians der Dynamik bzgl. state und action.
+        Mit Caching für Performance.
+        """
+        # Cache-Key für identical states/actions
+        cache_key = (z.data_ptr(), u.data_ptr())
+        if cache_key in self.jacobian_cache:
+            self.cache_hits += 1
+            return self.jacobian_cache[cache_key]
         
-        if self.hybrid_mpc_enabled and env is not None:
-            # Create enhanced environment interface
-            self.env_interface = ImprovedEnvironmentInterface(cfg, env, self.model)
-            
-            # Initialize hybrid MPC components
-            self.hybrid_mpc = HybridMPC(cfg, env, self.model)
-            self.hybrid_mpc.env_interface = self.env_interface
-            
-            # Performance tracking
-            self.performance_tracker = PerformanceTracker(cfg) if cfg.track_performance else None
-            
-            # Trajectory buffers for warm-starting
-            self.classical_trajectory_buffer = TrajectoryBuffer(
-                cfg.horizon, cfg.action_dim, device=self.device
-            )
-            self.learned_trajectory_buffer = TrajectoryBuffer(
-                cfg.horizon, cfg.action_dim, device=self.device
-            )
-            
-            print(f"Hybrid TD-MPC2 initialized with:")
-            print(f"  - Max classical horizon: {cfg.max_classical_horizon}")
-            print(f"  - Transition schedule: {cfg.transition_schedule}")
-            print(f"  - Value estimation: {cfg.hybrid_value_estimation}")
-            print(f"  - State conversion: {cfg.state_conversion_method}")
+        self.cache_misses += 1
+        
+        # Enable gradients für Jacobian-Berechnung
+        z_grad = z.detach().requires_grad_(True)
+        u_grad = u.detach().requires_grad_(True)
+        
+        # Forward pass durch dynamics
+        next_z = self.model.next(z_grad, u_grad, task)
+        
+        # Batch-Jacobian Berechnung (performanter als loops)
+        A = torch.autograd.grad(
+            outputs=next_z, inputs=z_grad,
+            grad_outputs=torch.eye(next_z.shape[-1], device=self.device).repeat(z.shape[0], 1, 1),
+            create_graph=False, retain_graph=True, only_inputs=True
+        )[0]
+        
+        B = torch.autograd.grad(
+            outputs=next_z, inputs=u_grad,
+            grad_outputs=torch.eye(next_z.shape[-1], device=self.device).repeat(z.shape[0], 1, 1),
+            create_graph=False, retain_graph=False, only_inputs=True
+        )[0]
+        
+        # Cache result (aber limitiert für Memory)
+        if len(self.jacobian_cache) < 1000:  # Cache size limit
+            self.jacobian_cache[cache_key] = (A.detach(), B.detach())
+        
+        return A, B
+    
+    def _cost_and_derivatives(self, z: torch.Tensor, u: torch.Tensor, task: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Berechnet Cost und dessen Ableitungen (für LQR backward pass).
+        """
+        # Reward als negative cost
+        reward = math.two_hot_inv(self.model.reward(z, u, task), self.model.cfg if hasattr(self.model, 'cfg') else type('cfg', (), {'bins': 255})())
+        cost = -reward
+        
+        # Erste Ableitungen
+        z_grad = z.requires_grad_(True)
+        u_grad = u.requires_grad_(True)
+        
+        cost_z = torch.autograd.grad(cost.sum(), z_grad, create_graph=True, retain_graph=True)[0]
+        cost_u = torch.autograd.grad(cost.sum(), u_grad, create_graph=True, retain_graph=True)[0]
+        
+        # Zweite Ableitungen (Hessians)
+        cost_zz = torch.autograd.grad(cost_z.sum(), z_grad, create_graph=False, retain_graph=True)[0]
+        cost_uu = torch.autograd.grad(cost_u.sum(), u_grad, create_graph=False, retain_graph=False)[0]
+        
+        return cost, cost_z, cost_u, cost_zz, cost_uu
+    
+    def _backward_pass(self, trajectory_z: torch.Tensor, trajectory_u: torch.Tensor, 
+                      terminal_value_fn: Optional[torch.Tensor] = None, task: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        ILQG Backward Pass - berechnet Feedback gains und feedforward terms.
+        """
+        horizon = trajectory_z.shape[0] - 1
+        k = torch.zeros(horizon, trajectory_u.shape[-1], device=self.device)  # feedforward
+        K = torch.zeros(horizon, trajectory_u.shape[-1], trajectory_z.shape[-1], device=self.device)  # feedback
+        
+        # Terminal Value Function (von TDMPC2)
+        if terminal_value_fn is not None:
+            V = terminal_value_fn
+            V_z = torch.autograd.grad(V.sum(), trajectory_z[-1], create_graph=True)[0]
+            V_zz = torch.autograd.grad(V_z.sum(), trajectory_z[-1], create_graph=False)[0]
         else:
-            self.hybrid_mpc = None
-            self.env_interface = None
-            print("Using standard TD-MPC2 planning")
+            # Fallback: Zero terminal cost
+            V = torch.zeros(trajectory_z.shape[0], device=self.device)
+            V_z = torch.zeros_like(trajectory_z[-1])
+            V_zz = torch.zeros(trajectory_z.shape[-1], trajectory_z.shape[-1], device=self.device)
+        
+        # Rückwärts durch Zeit
+        for t in reversed(range(horizon)):
+            z_t, u_t = trajectory_z[t], trajectory_u[t]
+            
+            # Dynamics Jacobians
+            A, B = self._compute_jacobians(z_t, u_t, task)
+            
+            # Cost derivatives
+            cost, cost_z, cost_u, cost_zz, cost_uu = self._cost_and_derivatives(z_t, u_t, task)
+            
+            # Q-function approximation (LQR)
+            Q_z = cost_z + A.T @ V_z
+            Q_u = cost_u + B.T @ V_z
+            Q_zz = cost_zz + A.T @ V_zz @ A
+            Q_uu = cost_uu + B.T @ V_zz @ B + self.config.regularization * torch.eye(B.shape[-1], device=self.device)
+            Q_uz = B.T @ V_zz @ A
+            
+            # Solve for gains (regularized inverse)
+            try:
+                Q_uu_inv = torch.linalg.inv(Q_uu)
+                k[t] = -Q_uu_inv @ Q_u
+                K[t] = -Q_uu_inv @ Q_uz
+            except torch.linalg.LinAlgError:
+                # Fallback bei singular matrix
+                k[t] = torch.zeros_like(Q_u)
+                K[t] = torch.zeros_like(Q_uz)
+            
+            # Value function update
+            V_z = Q_z + K[t].T @ Q_uu @ k[t] + K[t].T @ Q_u + Q_uz.T @ k[t]
+            V_zz = Q_zz + K[t].T @ Q_uu @ K[t] + K[t].T @ Q_uz + Q_uz.T @ K[t]
+        
+        return k, K
+    
+    def _forward_pass(self, trajectory_z: torch.Tensor, trajectory_u: torch.Tensor,
+                     k: torch.Tensor, K: torch.Tensor, alpha: float = 1.0,
+                     task: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        """
+        ILQG Forward Pass mit Line Search.
+        """
+        horizon = len(k)
+        new_trajectory_z = torch.zeros_like(trajectory_z)
+        new_trajectory_u = torch.zeros_like(trajectory_u)
+        new_trajectory_z[0] = trajectory_z[0]  # Gleicher Startzustand
+        
+        total_cost = 0.0
+        
+        for t in range(horizon):
+            z_t = new_trajectory_z[t]
+            
+            # Control update mit Line Search
+            delta_u = k[t] + K[t] @ (z_t - trajectory_z[t])
+            new_trajectory_u[t] = trajectory_u[t] + alpha * delta_u
+            new_trajectory_u[t] = torch.clamp(new_trajectory_u[t], -1, 1)  # Action bounds
+            
+            # Forward dynamics
+            new_trajectory_z[t+1] = self.model.next(z_t, new_trajectory_u[t], task)
+            
+            # Accumulate cost
+            reward = math.two_hot_inv(self.model.reward(z_t, new_trajectory_u[t], task), 
+                                    self.model.cfg if hasattr(self.model, 'cfg') else type('cfg', (), {'bins': 255})())
+            total_cost += -reward.sum().item()
+        
+        return new_trajectory_z, new_trajectory_u, total_cost
+    
+    def optimize(self, initial_state: torch.Tensor, warm_start_actions: Optional[torch.Tensor] = None,
+                terminal_value_fn: Optional[torch.Tensor] = None, task: Optional[torch.Tensor] = None) -> Dict:
+        """
+        Hauptfunktion: ILQG Optimierung mit Time Budget.
+        """
+        start_time = time.time()
+        
+        # Initialisierung
+        if warm_start_actions is not None:
+            actions = warm_start_actions[:self.horizon].clone()
+        else:
+            actions = torch.zeros(self.horizon, initial_state.shape[-1], device=self.device)
+        
+        # Forward rollout für initiale Trajektorie
+        states = torch.zeros(self.horizon + 1, initial_state.shape[-1], device=self.device)
+        states[0] = initial_state
+        
+        for t in range(self.horizon):
+            states[t+1] = self.model.next(states[t], actions[t], task)
+        
+        best_cost = float('inf')
+        converged = False
+        
+        # ILQG Iterationen mit Time Budget
+        for iteration in range(self.config.max_iterations):
+            # Check time budget
+            if (time.time() - start_time) * 1000 > self.config.max_time_budget_ms:
+                break
+                
+            # Backward pass
+            k, K = self._backward_pass(states, actions, terminal_value_fn, task)
+            
+            # Forward pass mit Line Search
+            best_alpha = 1.0
+            best_new_cost = best_cost
+            
+            for alpha in [1.0, 0.5, 0.25, 0.1]:  # Simple line search
+                new_states, new_actions, cost = self._forward_pass(states, actions, k, K, alpha, task)
+                
+                if cost < best_new_cost:
+                    best_alpha = alpha
+                    best_new_cost = cost
+                    best_states = new_states
+                    best_actions = new_actions
+            
+            # Update wenn Verbesserung
+            if best_new_cost < best_cost:
+                cost_improvement = best_cost - best_new_cost
+                states = best_states
+                actions = best_actions
+                best_cost = best_new_cost
+                
+                # Konvergenz Check
+                if cost_improvement < self.config.convergence_threshold:
+                    converged = True
+                    break
+        
+        execution_time = (time.time() - start_time) * 1000
+        
+        return {
+            'states': states,
+            'actions': actions,
+            'cost': best_cost,
+            'converged': converged,
+            'iterations': iteration + 1,
+            'execution_time_ms': execution_time,
+            'cache_hit_rate': self.cache_hits / (self.cache_hits + self.cache_misses) if (self.cache_hits + self.cache_misses) > 0 else 0
+        }
+
+
+class TDMPC2WithILQG(torch.nn.Module):
+    """
+    TDMPC2 mit ILQG Integration. Erweitert die originale TDMPC2 Klasse
+    um asynchrone ILQG-Optimierung ohne Performance-Einbußen.
+    """
+    
+    def __init__(self, cfg):
+        super().__init__()
+        
+        # Original TDMPC2 Initialisierung
+        self.cfg = cfg
+        self.device = torch.device('cuda:0')
+        self.model = WorldModel(cfg).to(self.device)
+        self.optim = torch.optim.Adam([
+            {'params': self.model._encoder.parameters(), 'lr': self.cfg.lr*self.cfg.enc_lr_scale},
+            {'params': self.model._dynamics.parameters()},
+            {'params': self.model._reward.parameters()},
+            {'params': self.model._termination.parameters() if self.cfg.episodic else []},
+            {'params': self.model._Qs.parameters()},
+            {'params': self.model._task_emb.parameters() if self.cfg.multitask else []
+             }
+        ], lr=self.cfg.lr, capturable=True)
+        self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=self.cfg.lr, eps=1e-5, capturable=True)
+        self.model.eval()
+        self.scale = RunningScale(cfg)
+        self.cfg.iterations += 2*int(cfg.action_dim >= 20)
+        self.discount = torch.tensor(
+            [self._get_discount(ep_len) for ep_len in cfg.episode_lengths], device='cuda:0'
+        ) if self.cfg.multitask else self._get_discount(cfg.episode_length)
+        self._prev_mean = torch.nn.Buffer(torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
+        
+        # ILQG Integration
+        self.ilqg_config = ILQGConfig(
+            enabled=getattr(cfg, 'use_ilqg', True),
+            max_iterations=getattr(cfg, 'ilqg_max_iterations', 5),
+            horizon=getattr(cfg, 'ilqg_horizon', 15),
+            num_workers=getattr(cfg, 'ilqg_workers', 2)
+        )
+        
+        if self.ilqg_config.enabled:
+            self.ilqg_solver = FastILQG(self.model, self.ilqg_config, self.device)
+            self.ilqg_executor = ThreadPoolExecutor(max_workers=self.ilqg_config.num_workers, thread_name_prefix="ILQG")
+            self.ilqg_futures = {}  # Track running ILQG optimizations
+            self.ilqg_results_buffer = deque(maxlen=100)  # Buffer für high-quality Trajektorien
+            self.step_counter = 0
+            self.ilqg_stats = {
+                'total_runs': 0,
+                'successful_runs': 0,
+                'avg_execution_time': 0.0,
+                'cache_hit_rate': 0.0
+            }
+        
+        # Compile wenn gewünscht
+        if cfg.compile:
+            print('Compiling update function with torch.compile...')
+            self._update = torch.compile(self._update, mode="reduce-overhead")
+
+    def _should_trigger_ilqg(self, z: torch.Tensor, task: Optional[torch.Tensor] = None) -> bool:
+        """
+        Entscheidet intelligently, ob ILQG für diesen State ausgeführt werden soll.
+        """
+        if not self.ilqg_config.enabled:
+            return False
+            
+        # Frequency-based triggering
+        if self.step_counter % self.ilqg_config.trigger_frequency != 0:
+            return False
+            
+        # Value uncertainty triggering (heuristisch)
+        with torch.no_grad():
+            action_samples = torch.randn(10, self.cfg.action_dim, device=self.device) * 0.1
+            q_values = []
+            for a in action_samples:
+                q_val = self.model.Q(z, a.unsqueeze(0), task, return_type='avg')
+                q_values.append(q_val)
+            
+            q_values = torch.stack(q_values)
+            uncertainty = q_values.std().item()
+            
+            return uncertainty > self.ilqg_config.trigger_uncertainty_threshold
+
+    def _collect_ilqg_results(self):
+        """
+        Sammelt fertige ILQG Resultate (non-blocking).
+        """
+        if not hasattr(self, 'ilqg_futures'):
+            return
+            
+        completed_futures = []
+        for future_id, future in self.ilqg_futures.items():
+            if future.done():
+                try:
+                    result = future.result()
+                    if result['converged']:
+                        self.ilqg_results_buffer.append(result)
+                        self.ilqg_stats['successful_runs'] += 1
+                        
+                        # Update stats
+                        self.ilqg_stats['avg_execution_time'] = (
+                            0.9 * self.ilqg_stats['avg_execution_time'] + 
+                            0.1 * result['execution_time_ms']
+                        )
+                        self.ilqg_stats['cache_hit_rate'] = result.get('cache_hit_rate', 0.0)
+                        
+                    self.ilqg_stats['total_runs'] += 1
+                    completed_futures.append(future_id)
+                except Exception as e:
+                    print(f"ILQG future failed: {e}")
+                    completed_futures.append(future_id)
+        
+        # Cleanup completed futures
+        for future_id in completed_futures:
+            del self.ilqg_futures[future_id]
 
     @torch.no_grad()
     def act(self, obs, t0=False, eval_mode=False, task=None):
-        """Enhanced action selection with hybrid planning."""
+        """
+        Erweiterte act-Funktion mit ILQG Integration.
+        Behält vollständige Kompatibilität zur Original-API.
+        """
+        self.step_counter += 1
+        
+        # Sammle fertige ILQG Resultate (non-blocking)
+        if self.ilqg_config.enabled:
+            self._collect_ilqg_results()
+        
+        # Original TDMPC2 action selection
         obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
         if task is not None:
             task = torch.tensor([task], device=self.device)
             
-        if self.hybrid_mpc_enabled and self.hybrid_mpc is not None:
-            if self.cfg.mpc:
-                # Use enhanced hybrid planning
-                action, info = self._enhanced_hybrid_plan(
-                    obs, t0=t0, eval_mode=eval_mode, task=task, return_info=True
-                )
-                
-                # Track performance if enabled
-                if self.performance_tracker and not eval_mode:
-                    self.performance_tracker.update(info)
-                
-                return action.cpu()
-            else:
-                # Fallback to policy
-                z = self.model.encode(obs, task)
-                action, info = self.model.pi(z, task)
-                if eval_mode:
-                    action = info["mean"]
-                return action[0].cpu()
+        if self.cfg.mpc:
+            action = self.plan(obs, t0=t0, eval_mode=eval_mode, task=task).cpu()
         else:
-            # Use standard TD-MPC2
-            return super().act(obs[0], t0, eval_mode, task[0] if task is not None else None)
-
-    @torch.no_grad()
-    def _enhanced_hybrid_plan(self, obs, t0=False, eval_mode=False, task=None, return_info=False):
-        """
-        Enhanced hybrid planning with better integration between classical and learned control.
-        """
-        # Get current planning horizons
-        classical_horizon = self._get_adaptive_classical_horizon(task)
-        total_horizon = self.cfg.horizon
+            z = self.model.encode(obs, task)
+            action, info = self.model.pi(z, task)
+            if eval_mode:
+                action = info["mean"]
+            action = action[0].cpu()
         
-        info = {
-            'classical_horizon': classical_horizon,
-            'total_horizon': total_horizon,
-            'planning_mode': 'hybrid'
-        }
+        # Asynchrone ILQG Optimierung triggern
+        if self.ilqg_config.enabled and not eval_mode:
+            z = self.model.encode(obs, task)
+            if self._should_trigger_ilqg(z, task):
+                self._submit_ilqg_optimization(z, task)
         
-        # Encode observation for learned planning
-        z = self.model.encode(obs, task)
-        
-        # Get state for classical planning
-        state = self.env_interface.obs_to_state(obs)
-        
-        if classical_horizon == 0:
-            # Pure learned MPC
-            info['planning_mode'] = 'learned'
-            action = self._plan(obs, t0, eval_mode, task)
-            
-        elif classical_horizon >= total_horizon:
-            # Pure classical MPC
-            info['planning_mode'] = 'classical'
-            action = self._pure_classical_plan(state, obs, z, classical_horizon, task, info)
-            
-        else:
-            # True hybrid planning
-            action = self._integrated_hybrid_plan(
-                state, obs, z, classical_horizon, t0, eval_mode, task, info
-            )
-        
-        if return_info:
-            return action, info
         return action
-
-    def _get_adaptive_classical_horizon(self, task=None):
-        """Get classical horizon with task-specific and performance-based adaptation."""
-        # Task-specific horizon if available
-        task_specific_horizons = getattr(self.cfg, 'task_specific_horizons', {})
-        if task is not None and task.item() in task_specific_horizons:
-            base_horizon = task_specific_horizons[task.item()]
-        else:
-            base_horizon = self.hybrid_mpc.get_classical_horizon()
-        
-        # Performance-based adaptation
-        if self.performance_tracker and self.cfg.classical_weight_schedule == 'adaptive':
-            performance_factor = self.performance_tracker.get_performance_factor()
-            adapted_horizon = int(base_horizon * performance_factor)
-            return max(self.cfg.min_classical_horizon, 
-                      min(adapted_horizon, self.cfg.max_classical_horizon))
-        
-        return base_horizon
-
-    @torch.no_grad()
-    def _pure_classical_plan(self, state, obs, z, horizon, task, info):
-        """Pure classical planning with learned value function terminal cost."""
-        # Get warm-start from buffer
-        initial_actions = None
-        if self.cfg.warm_start_classical:
-            initial_actions = self.classical_trajectory_buffer.get_shifted_trajectory()
-        
-        # Plan with classical MPC
-        actions, plan_info = self.hybrid_mpc.classical_mpc.plan(
-            state, horizon, initial_actions, task
-        )
-        
-        # Store trajectory
-        self.classical_trajectory_buffer.update(actions)
-        
-        # Augment with learned value estimate for terminal state
-        if self.cfg.hybrid_value_estimation in ['mixed', 'learned']:
-            # Simulate to terminal state
-            terminal_state = state
-            for t in range(min(horizon, actions.shape[0])):
-                terminal_state = self.env_interface.step_dynamics(terminal_state, actions[t])
-            
-            # Convert to observation and get value estimate
-            terminal_obs = self.env_interface.state_to_obs(terminal_state)
-            terminal_z = self.model.encode(terminal_obs, task)
-            terminal_action, _ = self.model.pi(terminal_z, task)
-            terminal_value = self.model.Q(terminal_z, terminal_action, task, return_type='avg')
-            
-            info['terminal_value'] = terminal_value.item()
-        
-        info.update(plan_info)
-        return actions[0]
-
-    @torch.no_grad()
-    def _integrated_hybrid_plan(self, state, obs, z, classical_horizon, t0, eval_mode, task, info):
-        """
-        Fully integrated hybrid planning that seamlessly combines classical and learned control.
-        """
-        # Initialize trajectory collections
-        trajectories = self._initialize_trajectory_collection(
-            state, obs, z, classical_horizon, task
-        )
-        
-        # Run integrated MPPI with hybrid dynamics
-        mean = self._get_initial_mean(classical_horizon, trajectories['classical'])
-        std = self._get_adaptive_std(classical_horizon)
-        
-        # Main MPPI loop with hybrid dynamics
-        for iteration in range(self.cfg.iterations):
-            # Sample actions with trust region around classical solution
-            actions = self._sample_hybrid_actions(
-                mean, std, trajectories, classical_horizon, iteration
-            )
-            
-            # Evaluate trajectories with hybrid dynamics
-            values = self._evaluate_hybrid_trajectories(
-                state, z, actions, classical_horizon, task
-            )
-            
-            # Update distribution with classical trust region
-            mean, std = self._update_hybrid_distribution(
-                actions, values, mean, classical_horizon, iteration, task
-            )
-        
-        # Select final action with optional blending
-        action = self._select_hybrid_action(
-            mean[0], std[0], trajectories['classical'][0], 
-            classical_horizon, eval_mode
-        )
-        
-        # Update trajectory buffers
-        self._update_trajectory_buffers(mean, trajectories['classical'])
-        
-        # Store mean for next iteration
-        if hasattr(self, '_prev_mean'):
-            self._prev_mean.copy_(mean)
-        
-        return action.clamp(-1, 1)
-
-    def _initialize_trajectory_collection(self, state, obs, z, classical_horizon, task):
-        """Initialize trajectory collection with classical, learned, and policy rollouts."""
-        trajectories = {}
-        
-        # Classical trajectory
-        initial_actions = None
-        if self.cfg.warm_start_classical:
-            initial_actions = self.classical_trajectory_buffer.get_shifted_trajectory()
-            
-        classical_actions, _ = self.hybrid_mpc.classical_mpc.plan(
-            state, self.cfg.horizon, initial_actions, task
-        )
-        trajectories['classical'] = classical_actions
-        
-        # Policy trajectory
-        if self.cfg.num_pi_trajs > 0:
-            pi_actions = torch.empty(
-                self.cfg.horizon, self.cfg.num_pi_trajs, 
-                self.cfg.action_dim, device=self.device
-            )
-            _z = z.repeat(self.cfg.num_pi_trajs, 1)
-            for t in range(self.cfg.horizon):
-                pi_actions[t], _ = self.model.pi(_z, task)
-                _z = self.model.next(_z, pi_actions[t], task)
-            trajectories['policy'] = pi_actions
-        
-        # Previous learned trajectory
-        if self.cfg.warm_start_learned and hasattr(self, '_prev_mean'):
-            trajectories['previous'] = self._prev_mean.clone()
-        
-        return trajectories
-
-    def _sample_hybrid_actions(self, mean, std, trajectories, classical_horizon, iteration):
-        """Sample actions with trust region around classical solution."""
-        num_samples = self.cfg.num_samples
-        actions = torch.empty(
-            self.cfg.horizon, num_samples, self.cfg.action_dim, 
-            device=self.device
-        )
-        
-        # Deterministic samples (classical, policy, etc.)
-        sample_idx = 0
-        
-        # Add classical trajectory
-        actions[:, sample_idx] = trajectories['classical']
-        sample_idx += 1
-        
-        # Add policy trajectories
-        if 'policy' in trajectories and self.cfg.num_pi_trajs > 0:
-            num_pi = min(self.cfg.num_pi_trajs, num_samples - sample_idx)
-            actions[:, sample_idx:sample_idx+num_pi] = trajectories['policy'][:, :num_pi]
-            sample_idx += num_pi
-        
-        # Sample remaining actions with trust region
-        num_random = num_samples - sample_idx
-        if num_random > 0:
-            # Use different sampling strategies for classical and learned horizons
-            for t in range(self.cfg.horizon):
-                if t < classical_horizon:
-                    # Tighter distribution around classical solution
-                    trust_weight = self.cfg.classical_trust_weight * \
-                                 (self.cfg.classical_trust_decay ** iteration)
-                    sample_mean = trust_weight * trajectories['classical'][t] + \
-                                (1 - trust_weight) * mean[t]
-                    sample_std = std[t] * (1 - trust_weight)
-                else:
-                    # Standard sampling for learned horizon
-                    sample_mean = mean[t]
-                    sample_std = std[t]
-                
-                noise = torch.randn(num_random, self.cfg.action_dim, device=self.device)
-                actions[t, sample_idx:] = (sample_mean + sample_std * noise).clamp(-1, 1)
-        
-        return actions
-
-    def _evaluate_hybrid_trajectories(self, initial_state, initial_z, actions, 
-                                    classical_horizon, task):
-        """Evaluate trajectories using hybrid dynamics and value estimation."""
-        num_samples = actions.shape[1]
-        device = actions.device
-        
-        # Initialize values
-        values = torch.zeros(num_samples, device=device)
-        discount = 1.0
-        
-        # State for classical dynamics
-        states = initial_state.repeat(num_samples, 1)
-        # Latent state for learned dynamics
-        zs = initial_z.repeat(num_samples, 1)
-        
-        # Track which dynamics to use
-        use_classical = torch.ones(num_samples, dtype=torch.bool, device=device)
-        
-        for t in range(self.cfg.horizon):
-            if t < classical_horizon:
-                # Classical dynamics phase
-                if self.cfg.hybrid_value_estimation in ['mixed', 'classical']:
-                    # Use classical dynamics
-                    next_states = self.env_interface.step_dynamics(states, actions[t])
-                    costs = self.env_interface.compute_cost(
-                        states, actions[t], next_states, task, timestep=t
-                    )
-                    rewards = self.env_interface.compute_reward_from_cost(costs)
-                    states = next_states
-                    
-                    # Update latent states for consistency
-                    if t == classical_horizon - 1:
-                        # Convert to observation for learned phase
-                        obs = self.env_interface.state_to_obs(states)
-                        zs = self.model.encode(obs, task)
-                else:
-                    # Use learned dynamics even in classical horizon
-                    rewards = math.two_hot_inv(
-                        self.model.reward(zs, actions[t], task), self.cfg
-                    )
-                    zs = self.model.next(zs, actions[t], task)
-            else:
-                # Learned dynamics phase
-                rewards = math.two_hot_inv(
-                    self.model.reward(zs, actions[t], task), self.cfg
-                )
-                zs = self.model.next(zs, actions[t], task)
-            
-            # Accumulate discounted rewards
-            values += discount * rewards
-            discount *= self.discount if isinstance(self.discount, float) else self.discount.mean()
-            
-            # Handle termination if episodic
-            if self.cfg.episodic and t >= classical_horizon:
-                termination = (self.model.termination(zs, task) > 0.5).float()
-                discount *= (1 - termination).squeeze()
-        
-        # Add terminal value
-        with torch.no_grad():
-            terminal_actions, _ = self.model.pi(zs, task)
-            terminal_values = self.model.Q(zs, terminal_actions, task, return_type='avg')
-            values += discount * terminal_values.squeeze()
-        
-        return values
-
-    def _update_hybrid_distribution(self, actions, values, prev_mean, 
-                                  classical_horizon, iteration, task):
-        """Update action distribution with classical bias."""
-        # Compute elite actions
-        num_elites = self.cfg.num_elites
-        elite_idxs = torch.topk(values, num_elites, dim=0).indices
-        elite_actions = actions[:, elite_idxs]
-        elite_values = values[elite_idxs]
-        
-        # Temperature-scaled weights
-        max_value = elite_values.max()
-        weights = F.softmax(
-            (elite_values - max_value) / self.cfg.temperature, dim=0
-        )
-        
-        # Weighted mean with classical bias
-        new_mean = torch.sum(
-            weights.unsqueeze(0).unsqueeze(-1) * elite_actions, dim=1
-        )
-        
-        # Adaptive blending based on iteration and horizon
-        for t in range(self.cfg.horizon):
-            if t < classical_horizon:
-                # Stronger classical influence for early timesteps
-                blend_factor = 0.8 * (1 - iteration / self.cfg.iterations)
-                new_mean[t] = blend_factor * prev_mean[t] + (1 - blend_factor) * new_mean[t]
-        
-        # Compute standard deviation
-        std = torch.sqrt(torch.sum(
-            weights.unsqueeze(0).unsqueeze(-1) * (elite_actions - new_mean.unsqueeze(1))**2, 
-            dim=1
-        ) + 1e-6)
-        
-        # Clamp standard deviation
-        std = std.clamp(self.cfg.min_std, self.cfg.max_std)
-        
-        # Apply action mask if multi-task
-        if self.cfg.multitask:
-            task_mask = self.model._action_masks[task[0]]
-            new_mean = new_mean * task_mask
-            std = std * task_mask
-        
-        return new_mean, std
-
-    def _get_initial_mean(self, classical_horizon, classical_actions):
-        """Get initial mean with proper warm-starting."""
-        mean = torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device)
-        
-        # Initialize with classical actions for classical horizon
-        mean[:classical_horizon] = classical_actions[:classical_horizon]
-        
-        # Warm-start remaining with previous solution
-        if hasattr(self, '_prev_mean'):
-            remaining = self.cfg.horizon - classical_horizon
-            if remaining > 0:
-                mean[classical_horizon:] = self._prev_mean[classical_horizon:classical_horizon+remaining]
-        
-        return mean
-
-    def _get_adaptive_std(self, classical_horizon):
-        """Get adaptive standard deviation based on planning phase."""
-        std = torch.full(
-            (self.cfg.horizon, self.cfg.action_dim), 
-            self.cfg.max_std, device=self.device
-        )
-        
-        # Lower variance for classical horizon
-        std[:classical_horizon] *= 0.5
-        
-        # Gradual increase for transition region
-        if self.cfg.blend_horizon > 0:
-            blend_start = classical_horizon
-            blend_end = min(classical_horizon + self.cfg.blend_horizon, self.cfg.horizon)
-            for t in range(blend_start, blend_end):
-                alpha = (t - blend_start) / self.cfg.blend_horizon
-                std[t] *= (0.5 + 0.5 * alpha)
-        
-        return std
-
-    def _select_hybrid_action(self, mean_action, std_action, classical_action, 
-                            classical_horizon, eval_mode):
-        """Select final action with optional blending."""
-        if eval_mode:
-            # Deterministic action
-            if classical_horizon > 0 and self.cfg.blend_actions:
-                # Blend with classical action
-                blend_weight = min(1.0, classical_horizon / self.cfg.max_classical_horizon)
-                return blend_weight * classical_action + (1 - blend_weight) * mean_action
-            else:
-                return mean_action
-        else:
-            # Stochastic action
-            base_action = mean_action + std_action * torch.randn_like(std_action)
-            
-            if classical_horizon > 0 and self.cfg.blend_actions:
-                # Blend with classical action
-                blend_weight = min(1.0, classical_horizon / self.cfg.max_classical_horizon)
-                return blend_weight * classical_action + (1 - blend_weight) * base_action
-            else:
-                return base_action
-
-    def _update_trajectory_buffers(self, learned_trajectory, classical_trajectory):
-        """Update trajectory buffers for warm-starting."""
-        self.learned_trajectory_buffer.update(learned_trajectory)
-        self.classical_trajectory_buffer.update(classical_trajectory)
-
-    def update_training_step(self, step):
-        """Update training step for all components."""
-        if self.hybrid_mpc is not None:
-            self.hybrid_mpc.update_step(step)
-
-    def get_diagnostics(self):
-        """Get diagnostic information for logging."""
-        diagnostics = {
-            "hybrid_enabled": self.hybrid_mpc_enabled,
-        }
-        
-        if self.hybrid_mpc is not None:
-            diagnostics.update({
-                "classical_horizon": self.hybrid_mpc.get_classical_horizon(),
-                "transition_progress": min(1.0, self.hybrid_mpc.current_step / self.cfg.transition_steps),
-            })
-        
-        if self.performance_tracker is not None:
-            diagnostics.update(self.performance_tracker.get_stats())
-        
-        return diagnostics
-
-
-class TrajectoryBuffer:
-    """Buffer for storing and warm-starting trajectories."""
     
-    def __init__(self, horizon, action_dim, device='cuda'):
-        self.horizon = horizon
-        self.action_dim = action_dim
-        self.device = device
-        self.trajectory = None
+    def _submit_ilqg_optimization(self, z: torch.Tensor, task: Optional[torch.Tensor]):
+        """
+        Startet asynchrone ILQG Optimierung (non-blocking).
+        """
+        # Check if we have capacity
+        if len(self.ilqg_futures) >= self.ilqg_config.num_workers:
+            return
+            
+        # Warm start von TDMPC2 policy
+        warm_start_actions = None
+        if self.ilqg_config.warm_start_from_tdmpc2:
+            with torch.no_grad():
+                warm_start_actions = torch.zeros(self.ilqg_config.horizon, self.cfg.action_dim, device=self.device)
+                z_temp = z.clone()
+                for t in range(min(self.ilqg_config.horizon, 10)):  # Limit für Performance
+                    action, _ = self.model.pi(z_temp, task)
+                    warm_start_actions[t] = action[0]
+                    z_temp = self.model.next(z_temp, action, task)
         
-    def update(self, trajectory):
-        """Update stored trajectory."""
-        self.trajectory = trajectory.detach().clone()
+        # Terminal value function von TDMPC2
+        terminal_value = None
+        if self.ilqg_config.horizon > self.cfg.horizon:
+            with torch.no_grad():
+                z_terminal = z.clone()
+                # Rollout to terminal state
+                for t in range(self.cfg.horizon):
+                    action, _ = self.model.pi(z_terminal, task)
+                    z_terminal = self.model.next(z_terminal, action, task)
+                terminal_action, _ = self.model.pi(z_terminal, task)
+                terminal_value = self.model.Q(z_terminal, terminal_action, task, return_type='avg')
         
-    def get_shifted_trajectory(self):
-        """Get time-shifted trajectory for warm-starting."""
-        if self.trajectory is None:
+        # Submit asynchron
+        future = self.ilqg_executor.submit(
+            self.ilqg_solver.optimize,
+            z.detach().clone(),
+            warm_start_actions.detach().clone() if warm_start_actions is not None else None,
+            terminal_value.detach().clone() if terminal_value is not None else None,
+            task.detach().clone() if task is not None else None
+        )
+        
+        self.ilqg_futures[id(future)] = future
+
+    def get_ilqg_enhanced_buffer_data(self):
+        """
+        Gibt high-quality Trajektorien aus ILQG für Experience Replay zurück.
+        """
+        if not self.ilqg_config.enabled or len(self.ilqg_results_buffer) == 0:
             return None
             
-        # Shift trajectory forward in time
-        shifted = torch.zeros_like(self.trajectory)
-        shifted[:-1] = self.trajectory[1:]
-        # Repeat last action or use zero
-        shifted[-1] = self.trajectory[-1]
-        
-        return shifted
-
-
-class PerformanceTracker:
-    """Track performance metrics for adaptive horizon selection."""
-    
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.window_size = cfg.performance_window
-        self.metrics_buffer = []
-        
-    def update(self, info):
-        """Update performance metrics."""
-        metrics = {
-            'planning_mode': info.get('planning_mode', 'unknown'),
-            'cost': info.get('final_cost', float('inf')),
-            'classical_horizon': info.get('classical_horizon', 0),
-            'planning_time': info.get('planning_time', 0),
-        }
-        
-        self.metrics_buffer.append(metrics)
-        if len(self.metrics_buffer) > self.window_size:
-            self.metrics_buffer.pop(0)
-    
-    def get_performance_factor(self):
-        """Get performance factor for adaptive horizon selection."""
-        if len(self.metrics_buffer) < 10:
-            return 1.0  # Not enough data
-        
-        # Separate metrics by planning mode
-        classical_costs = [m['cost'] for m in self.metrics_buffer if m['planning_mode'] == 'classical']
-        learned_costs = [m['cost'] for m in self.metrics_buffer if m['planning_mode'] == 'learned']
-        hybrid_costs = [m['cost'] for m in self.metrics_buffer if m['planning_mode'] == 'hybrid']
-        
-        # Compute average costs
-        avg_classical = np.mean(classical_costs) if classical_costs else float('inf')
-        avg_learned = np.mean(learned_costs) if learned_costs else float('inf')
-        avg_hybrid = np.mean(hybrid_costs) if hybrid_costs else float('inf')
-        
-        # Determine best mode
-        best_cost = min(avg_classical, avg_learned, avg_hybrid)
-        
-        if best_cost == avg_learned:
-            # Learned is best, reduce classical horizon
-            return 0.5
-        elif best_cost == avg_classical:
-            # Classical is best, increase classical horizon
-            return 1.5
-        else:
-            # Hybrid is best, maintain current balance
-            return 1.0
-    
-    def get_stats(self):
-        """Get performance statistics."""
-        if not self.metrics_buffer:
-            return {}
-        
-        costs = [m['cost'] for m in self.metrics_buffer]
-        planning_times = [m['planning_time'] for m in self.metrics_buffer]
-        
+        # Beste Trajektorie basierend auf Cost
+        best_result = min(self.ilqg_results_buffer, key=lambda x: x['cost'])
         return {
-            'avg_cost': np.mean(costs),
-            'min_cost': np.min(costs),
-            'max_cost': np.max(costs),
-            'avg_planning_time': np.mean(planning_times),
-            'buffer_size': len(self.metrics_buffer),
+            'states': best_result['states'],
+            'actions': best_result['actions'],
+            'priority_weight': 2.0,  # Höhere Priorität für ILQG Trajektorien
+            'source': 'ilqg'
+        }
+    
+    def get_ilqg_stats(self) -> Dict:
+        """
+        Gibt ILQG Performance-Statistiken zurück.
+        """
+        if not self.ilqg_config.enabled:
+            return {}
+            
+        return {
+            'ilqg_enabled': True,
+            'ilqg_runs_total': self.ilqg_stats['total_runs'],
+            'ilqg_success_rate': self.ilqg_stats['successful_runs'] / max(1, self.ilqg_stats['total_runs']),
+            'ilqg_avg_time_ms': self.ilqg_stats['avg_execution_time'],
+            'ilqg_cache_hit_rate': self.ilqg_stats['cache_hit_rate'],
+            'ilqg_buffer_size': len(self.ilqg_results_buffer),
+            'ilqg_active_optimizations': len(self.ilqg_futures)
         }
 
+    # Alle anderen Methoden aus der originalen TDMPC2 Klasse bleiben unverändert
+    def _get_discount(self, episode_length):
+        frac = episode_length/self.cfg.discount_denom
+        return min(max((frac-1)/(frac), self.cfg.discount_min), self.cfg.discount_max)
 
-# Environment-specific interface implementations
-class DMControlInterface(ImprovedEnvironmentInterface):
-    """DMControl-specific environment interface."""
-    
-    def __init__(self, cfg, env, world_model):
-        super().__init__(cfg, env, world_model)
-        self._setup_dmcontrol_specifics()
-        
-    def _setup_dmcontrol_specifics(self):
-        """Setup DMControl-specific parameters."""
-        # Get physics and spec
-        self.physics = self.env.physics if hasattr(self.env, 'physics') else None
-        self.task_spec = self.env.task if hasattr(self.env, 'task') else None
-        
-    def step_dynamics(self, state, action):
-        """Step dynamics using DMControl physics."""
-        if self.physics is not None:
-            # Set state
-            with self.physics.reset_context():
-                self.physics.set_state(state.cpu().numpy())
-            
-            # Apply action
-            self.physics.set_control(action.cpu().numpy())
-            
-            # Step physics
-            self.physics.step()
-            
-            # Get next state
-            next_state = torch.tensor(
-                self.physics.get_state(), 
-                device=state.device, 
-                dtype=state.dtype
-            )
-            return next_state
+    def save(self, fp):
+        torch.save({"model": self.model.state_dict()}, fp)
+
+    def load(self, fp):
+        if isinstance(fp, dict):
+            state_dict = fp
         else:
-            # Fallback to learned dynamics
-            return super().step_dynamics(state, action)
-    
-    def compute_cost(self, state, action, next_state, task=None, timestep=0):
-        """Compute cost using DMControl reward function."""
-        if self.task_spec is not None and hasattr(self.task_spec, 'get_reward'):
-            # Use environment's reward function
-            reward = self.task_spec.get_reward(self.physics)
-            return -reward  # Convert reward to cost
+            state_dict = torch.load(fp, map_location=torch.get_default_device(), weights_only=False)
+        state_dict = state_dict["model"] if "model" in state_dict else state_dict
+        state_dict = api_model_conversion(self.model.state_dict(), state_dict)
+        self.model.load_state_dict(state_dict)
+
+    @property
+    def plan(self):
+        _plan_val = getattr(self, "_plan_val", None)
+        if _plan_val is not None:
+            return _plan_val
+        if self.cfg.compile:
+            plan = torch.compile(self._plan, mode="reduce-overhead")
         else:
-            return super().compute_cost(state, action, next_state, task, timestep)
+            plan = self._plan
+        self._plan_val = plan
+        return self._plan_val
+
+    @torch.no_grad()
+    def _estimate_value(self, z, actions, task):
+        G, discount = 0, 1
+        termination = torch.zeros(self.cfg.num_samples, 1, dtype=torch.float32, device=z.device)
+        for t in range(self.cfg.horizon):
+            reward = math.two_hot_inv(self.model.reward(z, actions[t], task), self.cfg)
+            z = self.model.next(z, actions[t], task)
+            G = G + discount * (1-termination) * reward
+            discount_update = self.discount[torch.tensor(task)] if self.cfg.multitask else self.discount
+            discount = discount * discount_update
+            if self.cfg.episodic:
+                termination = torch.clip(termination + (self.model.termination(z, task) > 0.5).float(), max=1.)
+        action, _ = self.model.pi(z, task)
+        return G + discount * (1-termination) * self.model.Q(z, action, task, return_type='avg')
+
+    @torch.no_grad()
+    def _plan(self, obs, t0=False, eval_mode=False, task=None):
+        # Original TDMPC2 _plan method bleibt identisch
+        z = self.model.encode(obs, task)
+        if self.cfg.num_pi_trajs > 0:
+            pi_actions = torch.empty(self.cfg.horizon, self.cfg.num_pi_trajs, self.cfg.action_dim, device=self.device)
+            _z = z.repeat(self.cfg.num_pi_trajs, 1)
+            for t in range(self.cfg.horizon-1):
+                pi_actions[t], _ = self.model.pi(_z, task)
+                _z = self.model.next(_z, pi_actions[t], task)
+            pi_actions[-1], _ = self.model.pi(_z, task)
+
+        z = z.repeat(self.cfg.num_samples, 1)
+        mean = torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device)
+        std = torch.full((self.cfg.horizon, self.cfg.action_dim), self.cfg.max_std, dtype=torch.float, device=self.device)
+        if not t0:
+            mean[:-1] = self._prev_mean[1:]
+        actions = torch.empty(self.cfg.horizon, self.cfg.num_samples, self.cfg.action_dim, device=self.device)
+        if self.cfg.num_pi_trajs > 0:
+            actions[:, :self.cfg.num_pi_trajs] = pi_actions
+
+        for _ in range(self.cfg.iterations):
+            r = torch.randn(self.cfg.horizon, self.cfg.num_samples-self.cfg.num_pi_trajs, self.cfg.action_dim, device=std.device)
+            actions_sample = mean.unsqueeze(1) + std.unsqueeze(1) * r
+            actions_sample = actions_sample.clamp(-1, 1)
+            actions[:, self.cfg.num_pi_trajs:] = actions_sample
+            if self.cfg.multitask:
+                actions = actions * self.model._action_masks[task]
+
+            value = self._estimate_value(z, actions, task).nan_to_num(0)
+            elite_idxs = torch.topk(value.squeeze(1), self.cfg.num_elites, dim=0).indices
+            elite_value, elite_actions = value[elite_idxs], actions[:, elite_idxs]
+
+            max_value = elite_value.max(0).values
+            score = torch.exp(self.cfg.temperature*(elite_value - max_value))
+            score = score / score.sum(0)
+            mean = (score.unsqueeze(0) * elite_actions).sum(dim=1) / (score.sum(0) + 1e-9)
+            std = ((score.unsqueeze(0) * (elite_actions - mean.unsqueeze(1)) ** 2).sum(dim=1) / (score.sum(0) + 1e-9)).sqrt()
+            std = std.clamp(self.cfg.min_std, self.cfg.max_std)
+            if self.cfg.multitask:
+                mean = mean * self.model._action_masks[task]
+                std = std * self.model._action_masks[task]
+
+        rand_idx = math.gumbel_softmax_sample(score.squeeze(1))
+        actions = torch.index_select(elite_actions, 1, rand_idx).squeeze(1)
+        a, std = actions[0], std[0]
+        if not eval_mode:
+            a = a + std * torch.randn(self.cfg.action_dim, device=std.device)
+        self._prev_mean.copy_(mean)
+        return a.clamp(-1, 1)
+
+    def update_pi(self, zs, task):
+        action, info = self.model.pi(zs, task)
+        qs = self.model.Q(zs, action, task, return_type='avg', detach=True)
+        self.scale.update(qs[0])
+        qs = self.scale(qs)
+
+        rho = torch.pow(self.cfg.rho, torch.arange(len(qs), device=self.device))
+        pi_loss = (-(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho).mean()
+        pi_loss.backward()
+        pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
+        self.pi_optim.step()
+        self.pi_optim.zero_grad(set_to_none=True)
+
+        info = TensorDict({
+            "pi_loss": pi_loss,
+            "pi_grad_norm": pi_grad_norm,
+            "pi_entropy": info["entropy"],
+            "pi_scaled_entropy": info["scaled_entropy"],
+            "pi_scale": self.scale.value,
+        })
+        return info
+
+    @torch.no_grad()
+    def _td_target(self, next_z, reward, terminated, task):
+        action, _ = self.model.pi(next_z, task)
+        discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
+        return reward + discount * (1-terminated) * self.model.Q(next_z, action, task, return_type='min', target=True)
+
+    def _update(self, obs, action, reward, terminated, task=None):
+        # Original _update method bleibt unverändert
+        with torch.no_grad():
+            next_z = self.model.encode(obs[1:], task)
+            td_targets = self._td_target(next_z, reward, terminated, task)
+
+        self.model.train()
+
+        zs = torch.empty(self.cfg.horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)
+        z = self.model.encode(obs[0], task)
+        zs[0] = z
+        consistency_loss = 0
+        for t, (_action, _next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):
+            z = self.model.next(z, _action, task)
+            consistency_loss = consistency_loss + F.mse_loss(z, _next_z) * self.cfg.rho**t
+            zs[t+1] = z
+
+        _zs = zs[:-1]
+        qs = self.model.Q(_zs, action, task, return_type='all')
+        reward_preds = self.model.reward(_zs, action, task)
+        if self.cfg.episodic:
+            termination_pred = self.model.termination(zs[1:], task, unnormalized=True)
+
+        reward_loss, value_loss = 0, 0
+        for t, (rew_pred_unbind, rew_unbind, td_targets_unbind, qs_unbind) in enumerate(zip(reward_preds.unbind(0), reward.unbind(0), td_targets.unbind(0), qs.unbind(1))):
+            reward_loss = reward_loss + math.soft_ce(rew_pred_unbind, rew_unbind, self.cfg).mean() * self.cfg.rho**t
+            for _, qs_unbind_unbind in enumerate(qs_unbind.unbind(0)):
+                value_loss = value_loss + math.soft_ce(qs_unbind_unbind, td_targets_unbind, self.cfg).mean() * self.cfg.rho**t
+
+        consistency_loss = consistency_loss / self.cfg.horizon
+        reward_loss = reward_loss / self.cfg.horizon
+        if self.cfg.episodic:
+            termination_loss = F.binary_cross_entropy_with_logits(termination_pred, terminated)
+        else:
+            termination_loss = 0.
+        value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
+        total_loss = (
+            self.cfg.consistency_coef * consistency_loss +
+            self.cfg.reward_coef * reward_loss +
+            self.cfg.termination_coef * termination_loss +
+            self.cfg.value_coef * value_loss
+        )
+
+        total_loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
+        self.optim.step()
+        self.optim.zero_grad(set_to_none=True)
+
+        pi_info = self.update_pi(zs.detach(), task)
+        self.model.soft_update_target_Q()
+
+        self.model.eval()
+        info = TensorDict({
+            "consistency_loss": consistency_loss,
+            "reward_loss": reward_loss,
+            "value_loss": value_loss,
+            "termination_loss": termination_loss,
+            "total_loss": total_loss,
+            "grad_norm": grad_norm,
+        })
+        if self.cfg.episodic:
+            info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]))
+        info.update(pi_info)
+        
+        # Füge ILQG stats hinzu
+        info.update(self.get_ilqg_stats())
+        
+        return info.detach().mean()
+
+    def update(self, buffer):
+        obs, action, reward, terminated, task = buffer.sample()
+        kwargs = {}
+        if task is not None:
+            kwargs["task"] = task
+        torch.compiler.cudagraph_mark_step_begin()
+        return self._update(obs, action, reward, terminated, **kwargs)
+
+    def __del__(self):
+        """Cleanup beim Zerstören der Instanz"""
+        if hasattr(self, 'ilqg_executor'):
+            self.ilqg_executor.shutdown(wait=False)
+
+
+# Verwendungsbeispiel:
+# cfg.use_ilqg = True  # Aktiviert ILQG Integration
+# cfg.ilqg_max_iterations = 5  # Schnelle ILQG für Performance
+# cfg.ilqg_horizon = 15  # Längerer Horizont als MPPI
+# cfg.ilqg_workers = 2  # Thread pool size
+# 
+# agent = TDMPC2WithILQG(cfg)
+# 
+# # Normale Nutzung - API bleibt identisch!
+# action = agent.act(observation)
+# loss_info = agent.update(buffer)
+# 
+# # ILQG Statistics abrufen
+# stats = agent.get_ilqg_stats()
+# print(f"ILQG success rate: {stats.get('ilqg_success_rate', 0):.2%}")
